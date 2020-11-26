@@ -12,13 +12,13 @@
 
 static const int pagesize = 1024 * 4;
 
-void worker_run(pthread_t tid, int idx, unsigned long nr_samples) {
-  if (idx % 2 == 0 && nr_samples % 50 == 0) {
-    char* p = (char*)malloc(pagesize * idx * 100);
-    memset(p, 1, pagesize * idx * 100);
-    // printf("tid: %lu, index: %d, nr_samples: %lu\n", tid, idx, nr_samples);
-  }
-}
+/**
+ * 钩子函数，worker 每次执行时执行一次
+ * pid 当前执行的进程 id
+ * idx 当前 work 进程是其父 msg 进程的第几个孩子
+ * nr_run 当前进程第几次执行该函数
+ */
+void worker_run(pid_t pid, int idx, unsigned long nr_run) {}
 
 int main(int ac, char** av) {
   wlpthread_run(ac, av, worker_run);

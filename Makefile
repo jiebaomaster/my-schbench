@@ -8,7 +8,7 @@ ALL = $(PROGS)
 all: $(ALL)
 
 run: run.o
-	$(CC) $(ALL_CFLAGS) -o $@ $(filter %.o,$^) -lpthread
+	$(CC) $(ALL_CFLAGS) -o $@ $(filter %.o,$^)
 
 clean:
 	-rm -f *.o $(PROGS)

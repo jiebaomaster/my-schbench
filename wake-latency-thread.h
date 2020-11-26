@@ -1,5 +1,6 @@
 /*
- * schbench.c
+ * schbench.c =》wake-lantency-thread
+ * use porcess instead of thread
  *
  * Copyright (C) 2016 Facebook
  * Chris Mason <clm@fb.com>
@@ -12,10 +13,10 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <linux/futex.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <time.h>
@@ -56,9 +57,6 @@ static int autobench = 0;
 static int pipe_test = 0;
 /* -R requests per sec */
 static int requests_per_sec = 0;
-
-/* the message threads flip this to true when they decide runtime is up */
-static volatile unsigned long stopping = 0;
 
 /*
  * one stat struct per thread data, when the workers sleep this records the
@@ -213,6 +211,7 @@ static void parse_options(int ac, char** av) {
   }
 }
 
+// 计算时间差值
 void tvsub(struct timeval* tdiff, struct timeval* t1, struct timeval* t0) {
   tdiff->tv_sec = t1->tv_sec - t0->tv_sec;
   tdiff->tv_usec = t1->tv_usec - t0->tv_usec;
@@ -438,7 +437,7 @@ struct request {
  * giant stats struct
  */
 struct thread_data {
-  pthread_t tid;
+  pid_t pid;
   /* ->next is for placing us on the msg_thread's list for waking */
   struct thread_data* next;
 
@@ -460,8 +459,8 @@ struct thread_data {
   int thread_index;  // message/worker thread index
 
   /* worker 线程运行的自定义函数，每次唤醒时执行一次 */
-  void (*worker_rtn)(pthread_t,  // 线程号
-                     int,  // 线程索引，是 message 的第几个孩子
+  void (*worker_rtn)(pid_t,  // 线程号
+                     int,    // 线程索引，是 message 的第几个孩子
                      unsigned long);  // 运行的次数
 
   /* mr axboe's magic latency histogram */
@@ -478,8 +477,8 @@ struct thread_data {
  * https://cloud.tencent.com/developer/article/1176832
  * https://developer.aliyun.com/article/6043
  */
-#define FUTEX_BLOCKED 0
-#define FUTEX_RUNNING 1
+#define FUTEX_BLOCKED 0  // 锁被占用
+#define FUTEX_RUNNING 1  // 锁可用
 
 static int futex(int* uaddr,
                  int futex_op,
@@ -498,8 +497,11 @@ static int futex(int* uaddr,
 static void fpost(int* futexp) {
   int s;
 
+  // bool __sync_bool_compare_and_swap (type *ptr, type oldval type newval, ...)
+  // 比较*ptr与oldval的值，如果两者相等，则将newval更新到*ptr并返回true
   if (__sync_bool_compare_and_swap(futexp, FUTEX_BLOCKED, FUTEX_RUNNING)) {
-    s = futex(futexp, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+    // 多进程使用 FUTEX_WAKE，多线程使用 FUTEX_WAKE_PRIVATE
+    s = futex(futexp, FUTEX_WAKE, 1, NULL, NULL, 0);
     if (s == -1) {
       perror("FUTEX_WAKE");
       exit(1);
@@ -523,7 +525,7 @@ static int fwait(int* futexp, struct timespec* timeout) {
       break; /* Yes */
     }
     /* Futex is not available; wait */
-    s = futex(futexp, FUTEX_WAIT_PRIVATE, FUTEX_BLOCKED, timeout, NULL, 0);
+    s = futex(futexp, FUTEX_WAIT, FUTEX_BLOCKED, timeout, NULL, 0);
     if (s == -1 && errno != EAGAIN) {
       if (errno == ETIMEDOUT)
         return -ETIMEDOUT;
@@ -607,23 +609,24 @@ static void xlist_wake_all(struct thread_data* td) {
  * it, but that's good enough.  We gtod after waking and use that to
  * record scheduler latency.
  */
-static struct request* msg_and_wait(struct thread_data* td) {
+static struct request* msg_and_wait(struct thread_data* work_td,
+                                    int* stopping) {
   struct timeval now;
   unsigned long long delta;
 
   if (pipe_test)
-    memset(td->pipe_page, 2, pipe_test);
+    memset(work_td->pipe_page, 2, pipe_test);
 
   /* set ourselves to blocked */
-  td->futex = FUTEX_BLOCKED;
-  gettimeofday(&td->wake_time, NULL);
+  work_td->futex = FUTEX_BLOCKED;
+  gettimeofday(&work_td->wake_time, NULL);
 
   /* add us to the list */
   // 关联 messager 和 workers，这样就可以通过 messager 唤醒 worker
-  xlist_add(td->msg_thread, td);
+  xlist_add(work_td->msg_thread, work_td);
 
   // 唤醒 messager 进程，即将 messager 进程加入运行队列
-  fpost(&td->msg_thread->futex);
+  fpost(&work_td->msg_thread->futex);
 
   /*
    * don't wait if the main threads are shutting down,
@@ -631,17 +634,17 @@ static struct request* msg_and_wait(struct thread_data* td) {
    * as the message thread walks his list after setting stopping,
    * we shouldn't miss the wakeup
    */
-  if (!stopping) {
+  if (!*stopping) {
     /* if he hasn't already woken us up, wait */
-    fwait(&td->futex, NULL);  // 睡眠，等待 messager 进程唤醒，即从运行队列删除
+    fwait(&work_td->futex, NULL);  // 等待 msg 进程唤醒，即从运行队列删除
   }
 
   if (!requests_per_sec) {
     gettimeofday(&now, NULL);
     // 调度延迟为当前时间减去 work 进程被 messager 唤醒加入运行队列的时间
-    delta = tvdelta(&td->wake_time, &now);
+    delta = tvdelta(&work_td->wake_time, &now);
     if (delta > 0)
-      add_lat(&td->stats, delta);  // 记录调度时延
+      add_lat(&work_td->stats, delta);  // 记录调度时延
   }
   return NULL;
 }
@@ -656,6 +659,7 @@ static struct request* msg_and_wait(struct thread_data* td) {
 #error Unsupported architecture
 #endif
 
+// 原地自旋一定长度的时间
 static void usec_spin(unsigned long spin_time) {
   struct timeval now;
   struct timeval start;
@@ -680,21 +684,21 @@ static void usec_spin(unsigned long spin_time) {
  * for posting by the worker threads, replying to their messages after
  * a delay of 'sleeptime' + some jitter.
  */
-static void run_msg_thread(struct thread_data* td) {
-  unsigned int seed = pthread_self();
+static void run_msg_thread(struct thread_data* msg_td, int* stopping) {
+  unsigned int seed = getpid();
   int max_jitter = sleeptime / 4;
   int jitter = 0;
 
   while (1) {
-    td->futex = FUTEX_BLOCKED;
-    xlist_wake_all(td);  // 唤醒所有 worker 线程，即 work 线程被加入运行队列
+    msg_td->futex = FUTEX_BLOCKED;
+    xlist_wake_all(msg_td);  // 唤醒所有 worker 线程，即 work 线程被加入运行队列
 
-    if (stopping) {
-      xlist_wake_all(td);
+    if (*stopping) {
+      xlist_wake_all(msg_td);
       break;
     }
     if (sleeptime)  // 等待 worker 线程唤醒
-      fwait(&td->futex, NULL);
+      fwait(&msg_td->futex, NULL);
 
     /*
      * messages shouldn't be instant, sleep a little to make them
@@ -712,28 +716,27 @@ static void run_msg_thread(struct thread_data* td) {
  * the worker thread is pretty simple, it just does a single spin and
  * then waits on a message from the message thread
  */
-void* worker_thread(void* arg) {
-  struct thread_data* td = arg;
+void* worker_thread(void* arg, int* stopping) {
+  struct thread_data* work_td = arg;
   struct timeval now;
   struct timeval start;
-  struct request* req = NULL;
 
   gettimeofday(&start, NULL);
   while (1) {
-    if (stopping)
+    if (*stopping)
       break;
 
     usec_spin(cputime);
-    td->worker_rtn(td->tid, td->thread_index,
-                   td->stats.nr_samples);  // 运行自定义函数
-    td->loop_count++;
+    work_td->worker_rtn(work_td->pid, work_td->thread_index,
+                        work_td->stats.nr_samples);  // 运行自定义函数
+    work_td->loop_count++;
     gettimeofday(&now, NULL);
-    td->runtime = tvdelta(&start, &now);
+    work_td->runtime = tvdelta(&start, &now);
 
-    req = msg_and_wait(td);  //
+    msg_and_wait(work_td, stopping);
   }
   gettimeofday(&now, NULL);
-  td->runtime = tvdelta(&start, &now);
+  work_td->runtime = tvdelta(&start, &now);
 
   return NULL;
 }
@@ -743,13 +746,14 @@ void* worker_thread(void* arg) {
  * replying when they post him.  He collects latency stats as all the threads
  * exit
  */
-void* message_thread(void* arg) {
-  struct thread_data* td = arg;
+void* message_thread(void* arg, int msg_index, int* stopping) {
+  struct thread_data* msg_td =
+      (struct thread_data*)arg + msg_index;  // 当前 msg 进程数据
   struct thread_data* worker_threads_mem = NULL;
   int i;
   int ret;
 
-  worker_threads_mem = td + 1;
+  worker_threads_mem = msg_td + 1;
 
   if (!worker_threads_mem) {
     perror("unable to allocate ram");
@@ -757,29 +761,34 @@ void* message_thread(void* arg) {
   }
 
   for (i = 0; i < worker_threads; i++) {
-    pthread_t tid;
+    pid_t pid;
 
-    worker_threads_mem[i].msg_thread = td;
-    ret = pthread_create(&tid, NULL, worker_thread, worker_threads_mem + i);
-    if (ret) {
-      fprintf(stderr, "error %d from pthread_create\n", ret);
+    if ((pid = fork()) < 0) {
+      perror("fork error!");
       exit(1);
+    } else if (pid == 0) {  // child
+      worker_thread(worker_threads_mem + i, stopping);
+      return;
+    } else {  // father
+      worker_threads_mem[i].pid = pid;
+      worker_threads_mem[i].thread_index = i;
+      worker_threads_mem[i].worker_rtn = msg_td->worker_rtn;
+      worker_threads_mem[i].msg_thread = msg_td;
     }
-    worker_threads_mem[i].tid = tid;
-    worker_threads_mem[i].thread_index = i;
-    worker_threads_mem[i].worker_rtn = td->worker_rtn;
   }
 
-  run_msg_thread(td);
+  run_msg_thread(msg_td, stopping);
 
-  for (i = 0; i < worker_threads;
-       i++) {  // 唤醒所有工作进程，并等待他们运行结束
+  // 唤醒所有 work 进程，并等待他们运行结束
+  for (i = 0; i < worker_threads; i++) {
     fpost(&worker_threads_mem[i].futex);
-    pthread_join(worker_threads_mem[i].tid, NULL);
+    while (waitpid(worker_threads_mem[i].pid, NULL, 0) > 0)
+      ;
   }
   return NULL;
 }
 
+// 合并进程的统计信息
 static void combine_message_thread_stats(struct stats* stats,
                                          struct thread_data* thread_data,
                                          unsigned long long* loop_count,
@@ -818,7 +827,8 @@ static void reset_thread_stats(struct thread_data* thread_data) {
 }
 
 /* runtime from the command line is in seconds.  Sleep until its up */
-static void sleep_for_runtime(struct thread_data* message_threads_mem) {
+static void sleep_for_runtime(struct thread_data* message_threads_mem,
+                              int* stopping) {
   struct timeval now;
   struct timeval zero_time;
   struct timeval last_calc;
@@ -850,7 +860,8 @@ static void sleep_for_runtime(struct thread_data* message_threads_mem) {
       break;
 
     if (!requests_per_sec && !pipe_test && runtime_delta > warmup_usec &&
-        !warmup_done && warmuptime) {
+        !warmup_done &&
+        warmuptime) {  // 运行一段热机时间，结束时清空热机统计数据
       warmup_done = 1;
       fprintf(stderr, "warmup done, zeroing stats\n");
       zero_time = now;
@@ -876,7 +887,7 @@ static void sleep_for_runtime(struct thread_data* message_threads_mem) {
     sleep(1);
   }
   __sync_synchronize();  // 读写内存屏障
-  stopping = 1;
+  *stopping = 1;
 }
 
 /* 运行测试 */
@@ -888,56 +899,57 @@ int wlpthread_run(int ac,
   int i;
   int ret;
   struct thread_data* message_threads_mem = NULL;
+  int* stopping = NULL;  // 控制全局运行状态
   struct stats stats;
   unsigned long long loop_count;
   unsigned long long loop_runtime;
 
-  parse_options(ac, av);  // 将命令行参数赋值给全局变量
-  stopping = 0;           // 全局变量，标志整个系统是否停止运行
-  memset(&stats, 0, sizeof(stats));
-  message_threads_mem =
-      calloc(message_threads * worker_threads + message_threads,
-             sizeof(struct thread_data));
+  // 申请共享内存，fork 自动共享，参考 http://man.he.net/man2/futex
+  message_threads_mem = (struct thread_data*)mmap(
+      NULL,
+      sizeof(struct thread_data) *
+          (message_threads * worker_threads + message_threads),
+      PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+  stopping = (int*)mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE,
+                        MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+  *stopping = 0;
 
-  if (!message_threads_mem) {
-    perror("unable to allocate message threads");
-    return -1;
-  }
+  parse_options(ac, av);  // 将命令行参数赋值给全局变量
+  memset(&stats, 0, sizeof(stats));
 
   for (i = 0; i < message_threads; i++)  // 创建 message 线程
   {
-    pthread_t tid;
-    int index =
-        i * worker_threads + i;  // 数组中存储按照 [(message, workers...)
-    /**
-     *  int pthread_create(pthread_t*restrict tidp,const pthread_attr_t
-     * *restrict_attr,void*（*start_rtn)(void*),void *restrict arg);
-     * 参数：指向线程标识符的指针，设置线程属性，线程运行函数的起始地址，运行函数的参数（多参数传结构体）
-     */
-    ret =
-        pthread_create(&tid, NULL, message_thread, message_threads_mem + index);
-    if (ret) {
-      fprintf(stderr, "error %d from pthread_create\n", ret);
+    // 父进程位置，数组 [(message, workers...)
+    int msg_index = i * worker_threads + i;
+    pid_t pid;
+
+    if ((pid = fork()) < 0) {
+      perror("fork error!");
       exit(1);
+    } else if (pid == 0) {  // child
+      message_thread(message_threads_mem, msg_index, stopping);
+      return;
+    } else {  // father
+      message_threads_mem[msg_index].pid = pid;
+      message_threads_mem[msg_index].thread_index = i;
+      message_threads_mem[msg_index].worker_rtn = worker_rtn;
     }
-    message_threads_mem[index].tid = tid;
-    message_threads_mem[index].thread_index = i;
-    message_threads_mem[index].worker_rtn = worker_rtn;
   }
 
-  sleep_for_runtime(message_threads_mem);
+  sleep_for_runtime(message_threads_mem, stopping);
+  // 唤醒所有 message 进程，并等待他们运行结束
   for (int i = 0; i < message_threads; i++) {
     int index = i * worker_threads + i;
-    fpost(&message_threads_mem[index].futex);  // 唤醒父消息进程
-    pthread_join(message_threads_mem[index].tid,
-                 NULL);  // 等待父消息进程运行结束
+    fpost(&message_threads_mem[index].futex);
+    while (waitpid(message_threads_mem[index].pid, NULL, 0) > 0)
+      ;
   }
 
   memset(&stats, 0, sizeof(stats));
   // 所有的进程运行完毕之后，将所有的进程延迟时间的统计信息合并到一个统计信息结构体中
   combine_message_thread_stats(&stats, message_threads_mem, &loop_count,
                                &loop_runtime);
-  free(message_threads_mem);
+
   // 显示最终统计信息，系统中总的输出有定时（per 10s）输出，还有一次最终输出
   show_latencies(&stats, runtime);
 }
