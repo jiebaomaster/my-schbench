@@ -18,10 +18,10 @@ static const int pagesize = 1024 * 4;
  * idx 当前 work 进程是其父 msg 进程的第几个孩子
  * nr_run 当前进程第几次执行该函数
  */
-void worker_run(pid_t pid, int idx, unsigned long nr_run) {}
+void worker_load(pid_t pid, int idx, unsigned long nr_run) {}
 
 int main(int ac, char** av) {
-  wlpthread_run(ac, av, worker_run);
+  wlpthread_run(ac, av, worker_load);
 
   return 0;
 }

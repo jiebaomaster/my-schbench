@@ -458,10 +458,10 @@ struct thread_data {
 
   int thread_index;  // message/worker thread index
 
-  /* worker 线程运行的自定义函数，每次唤醒时执行一次 */
-  void (*worker_rtn)(pid_t,  // 线程号
-                     int,    // 线程索引，是 message 的第几个孩子
-                     unsigned long);  // 运行的次数
+  /* worker 线程运行的自定义负载函数，每次唤醒时执行一次 */
+  void (*worker_load)(pid_t,  // 线程号
+                      int,    // 线程索引，是 message 的第几个孩子
+                      unsigned long);  // 运行的次数
 
   /* mr axboe's magic latency histogram */
   struct stats stats;
@@ -690,7 +690,7 @@ static void run_msg_thread(struct thread_data* msg_td, int* stopping) {
   int jitter = 0;
 
   while (1) {
-    msg_td->futex = FUTEX_BLOCKED;
+    msg_td->futex = FUTEX_BLOCKED;  // 保证下面的 wait 总能陷入睡眠等待
     xlist_wake_all(msg_td);  // 唤醒所有 worker 线程，即 work 线程被加入运行队列
 
     if (*stopping) {
@@ -727,8 +727,8 @@ void* worker_thread(void* arg, int* stopping) {
       break;
 
     usec_spin(cputime);
-    work_td->worker_rtn(work_td->pid, work_td->thread_index,
-                        work_td->stats.nr_samples);  // 运行自定义函数
+    work_td->worker_load(work_td->pid, work_td->thread_index,
+                         work_td->stats.nr_samples);  // 运行自定义函数
     work_td->loop_count++;
     gettimeofday(&now, NULL);
     work_td->runtime = tvdelta(&start, &now);
@@ -772,7 +772,7 @@ void* message_thread(void* arg, int msg_index, int* stopping) {
     } else {  // father
       worker_threads_mem[i].pid = pid;
       worker_threads_mem[i].thread_index = i;
-      worker_threads_mem[i].worker_rtn = msg_td->worker_rtn;
+      worker_threads_mem[i].worker_load = msg_td->worker_load;
       worker_threads_mem[i].msg_thread = msg_td;
     }
   }
@@ -893,9 +893,9 @@ static void sleep_for_runtime(struct thread_data* message_threads_mem,
 /* 运行测试 */
 int wlpthread_run(int ac,
                   char** av,
-                  void (*worker_rtn)(pthread_t,  // worker 函数
-                                     int,
-                                     unsigned long)) {
+                  void (*worker_load)(pthread_t,  // worker 函数
+                                      int,
+                                      unsigned long)) {
   int i;
   int ret;
   struct thread_data* message_threads_mem = NULL;
@@ -932,7 +932,7 @@ int wlpthread_run(int ac,
     } else {  // father
       message_threads_mem[msg_index].pid = pid;
       message_threads_mem[msg_index].thread_index = i;
-      message_threads_mem[msg_index].worker_rtn = worker_rtn;
+      message_threads_mem[msg_index].worker_load = worker_load;
     }
   }
 
